@@ -7,6 +7,13 @@ response:
 
   2026-06-10 14:23:01  [generative-radio]  in:  847 tok @ 38.5 tok/s   out: 312 tok @ 44.2 tok/s
 
+When inference slots are full, incoming requests queue and the proxy prints
+status lines so you can see concurrency at a glance:
+
+  2026-06-10 14:23:01  [logger          ]  queued   (active=4/4  waiting=1)
+  2026-06-10 14:23:24  [logger          ]  started  (waited 23.1s)
+  2026-06-10 14:23:26  [logger          ]  in:  523 tok @ 41.2 tok/s   out:  89 tok @ 48.1 tok/s
+
 Run:
   python server.py
   AIMODEL_OLLAMA_URL=http://localhost:11434 \
@@ -21,6 +28,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncIterator
 
@@ -46,8 +54,31 @@ APP_PORTS: dict[int, str] = {
     int(os.getenv("AIMODEL_PROXY_PORT_LOGGER", "11431")): "logger",
 }
 
-# Timeout for forwarded requests (seconds).  LLM calls can be slow.
-TIMEOUT = 600.0
+# Match the Ollama setting so the proxy queues at the same limit.
+_OLLAMA_NUM_PARALLEL = int(os.getenv("OLLAMA_NUM_PARALLEL", "4"))
+
+# Initialized in lifespan (requires event loop).
+_client: httpx.AsyncClient
+_inference_sem: asyncio.Semaphore
+
+# Active / waiting counters (asyncio is single-threaded — no locks needed).
+_active = 0
+_queued = 0
+
+# ---------------------------------------------------------------------------
+# Lifespan — create / close shared resources
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _client, _inference_sem
+    _inference_sem = asyncio.Semaphore(_OLLAMA_NUM_PARALLEL)
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    yield
+    await _client.aclose()
 
 # ---------------------------------------------------------------------------
 # Stats formatting
@@ -78,6 +109,45 @@ def _fmt_stats(app: str, body: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Inference slot — queuing + monitoring
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def _inference_slot(app: str):
+    """Acquire one parallel inference slot; log if the request had to queue."""
+    global _active, _queued
+
+    label = f"[{app:{_COL_WIDTH}}]"
+    waited = False
+    t0: float = 0.0
+
+    if _inference_sem.locked():
+        _queued += 1
+        waited = True
+        t0 = asyncio.get_event_loop().time()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(
+            f"{ts}  {label}  queued   (active={_active}/{_OLLAMA_NUM_PARALLEL}  waiting={_queued})",
+            flush=True,
+        )
+
+    await _inference_sem.acquire()
+
+    if waited:
+        _queued -= 1
+        elapsed = asyncio.get_event_loop().time() - t0
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{ts}  {label}  started  (waited {elapsed:.1f}s)", flush=True)
+
+    _active += 1
+    try:
+        yield
+    finally:
+        _active -= 1
+        _inference_sem.release()
+
+
+# ---------------------------------------------------------------------------
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
@@ -104,10 +174,12 @@ async def _proxy_non_streaming(
     headers: dict,
     content: bytes,
 ) -> Response:
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.request(method, url, content=content, headers=headers)
+    async with _inference_slot(app):
+        try:
+            r = await _client.request(method, url, content=content, headers=headers)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            return Response(content=f"Proxy error: {exc}", status_code=504)
 
-    # Attempt stats extraction on JSON responses from inference paths.
     try:
         body = r.json()
         line = _fmt_stats(app, body)
@@ -130,23 +202,24 @@ async def _proxy_streaming(
     headers: dict,
     content: bytes,
 ) -> StreamingResponse:
-    """Stream response chunks through; extract stats from the final chunk."""
+    """Stream response chunks; hold the inference slot for the full generation."""
 
     async def _generate() -> AsyncIterator[bytes]:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            async with client.stream(method, url, content=content, headers=headers) as r:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
-                    # Try to extract stats from each JSON line (Ollama sends
-                    # one JSON object per line in streaming mode).
-                    try:
-                        obj = json.loads(chunk.decode())
-                        if obj.get("done"):
-                            line = _fmt_stats(app, obj)
-                            if line:
-                                print(line, flush=True)
-                    except Exception:
-                        pass
+        async with _inference_slot(app):
+            try:
+                async with _client.stream(method, url, content=content, headers=headers) as r:
+                    async for chunk in r.aiter_bytes():
+                        yield chunk
+                        try:
+                            obj = json.loads(chunk.decode())
+                            if obj.get("done"):
+                                line = _fmt_stats(app, obj)
+                                if line:
+                                    print(line, flush=True)
+                        except Exception:
+                            pass
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                yield json.dumps({"error": f"Proxy error: {exc}", "done": True}).encode()
 
     return StreamingResponse(_generate(), media_type="application/x-ndjson")
 
@@ -155,14 +228,19 @@ async def _proxy_streaming(
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(docs_url=None, redoc_url=None)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 @app.get("/health")
 async def health(request: Request) -> dict:
     port: int = request.scope["server"][1]
     app_name = APP_PORTS.get(port, f"unknown:{port}")
-    return {"status": "ok", "app": app_name, "ollama": OLLAMA_URL}
+    return {
+        "status": "ok",
+        "app": app_name,
+        "ollama": OLLAMA_URL,
+        "slots": {"active": _active, "queued": _queued, "limit": _OLLAMA_NUM_PARALLEL},
+    }
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"])
@@ -197,8 +275,18 @@ async def proxy(path: str, request: Request) -> Response:
 
     if is_inference and streaming:
         return await _proxy_streaming(app_name, request.method, target_url, fwd_headers, forward_body)
-    else:
+    elif is_inference:
         return await _proxy_non_streaming(app_name, request.method, target_url, fwd_headers, forward_body)
+    else:
+        # Non-inference pass-through (tags, blobs, version, etc.) — no slot needed.
+        try:
+            r = await _client.request(
+                request.method, target_url, content=raw_body, headers=fwd_headers,
+                timeout=httpx.Timeout(connect=10.0, read=30.0),
+            )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            return Response(content=f"Proxy error: {exc}", status_code=504)
+        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +309,7 @@ async def _serve_all() -> None:
     print(f"aimodel proxy ready — forwarding to {OLLAMA_URL}", flush=True)
     for name, port, _ in servers:
         print(f"  {name:<20} → http://127.0.0.1:{port}", flush=True)
+    print(f"  inference slots: {_OLLAMA_NUM_PARALLEL}", flush=True)
     print(flush=True)
 
     await asyncio.gather(*[s.serve() for _, _, s in servers])
