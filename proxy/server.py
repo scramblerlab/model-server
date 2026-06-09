@@ -164,6 +164,14 @@ def _strip_keep_alive(body: dict) -> dict:
     return body
 
 
+def _disable_thinking(body: dict) -> dict:
+    """Inject think=False so reasoning models (e.g. Qwen3) skip extended thinking."""
+    if body.get("think") is not False:
+        body = dict(body)
+        body["think"] = False
+    return body
+
+
 _STATS_PATHS = {"/api/chat", "/api/generate"}
 
 
@@ -255,6 +263,7 @@ async def proxy(path: str, request: Request) -> Response:
         try:
             parsed = json.loads(raw_body)
             cleaned = _strip_keep_alive(parsed)
+            cleaned = _disable_thinking(cleaned)
             # Detect whether the client requested streaming.
             streaming = cleaned.get("stream", True)
             forward_body = json.dumps(cleaned).encode()
