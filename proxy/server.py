@@ -291,7 +291,7 @@ async def proxy(path: str, request: Request) -> Response:
         try:
             r = await _client.request(
                 request.method, target_url, content=raw_body, headers=fwd_headers,
-                timeout=httpx.Timeout(connect=10.0, read=30.0),
+                timeout=httpx.Timeout(30.0, connect=10.0),
             )
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
             return Response(content=f"Proxy error: {exc}", status_code=504)
