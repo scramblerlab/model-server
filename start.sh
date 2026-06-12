@@ -47,7 +47,17 @@ if ! command -v ollama &>/dev/null; then
   curl -fsSL https://ollama.com/install.sh | sh
   echo "  Ollama installed."
 else
-  INSTALLED_VERSION=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+  # NOTE: `ollama --version` reports the version of any *running server* (which
+  # may be a different install, e.g. the menu-bar app), so query the package
+  # manager for the CLI's own version when Homebrew manages it.
+  OLLAMA_VIA_BREW=""
+  if command -v brew &>/dev/null && brew list ollama &>/dev/null; then
+    OLLAMA_VIA_BREW=1
+    INSTALLED_VERSION=$(brew list --versions ollama 2>/dev/null \
+      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+  else
+    INSTALLED_VERSION=$(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
+  fi
   LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/ollama/ollama/releases/latest" 2>/dev/null \
     | grep '"tag_name"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
 
@@ -56,8 +66,15 @@ else
   elif [ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]; then
     echo "  Ollama $INSTALLED_VERSION installed; $LATEST_VERSION available."
     echo "  Updating Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-    echo "  Ollama updated to $LATEST_VERSION."
+    if [ -n "$OLLAMA_VIA_BREW" ]; then
+      brew upgrade ollama
+      echo "  Ollama updated to $LATEST_VERSION."
+    else
+      # The CLI is the Ollama.app bundle (ollama.com/install.sh is Linux-only,
+      # so it cannot update a macOS install). The app self-updates on launch;
+      # a transient mismatch here is harmless — just inform and continue.
+      echo "  NOTE: Ollama is the macOS app bundle — open Ollama.app once to let it self-update."
+    fi
   else
     echo "  Ollama $INSTALLED_VERSION (up to date)"
   fi
@@ -76,11 +93,42 @@ export OLLAMA_NUM_PARALLEL=4
 export OLLAMA_FLASH_ATTENTION=1
 export OLLAMA_KV_CACHE_TYPE=q8_0
 export OLLAMA_KEEP_ALIVE=-1
-export OLLAMA_NUM_CTX=8192
+# Note: the variable is OLLAMA_CONTEXT_LENGTH — OLLAMA_NUM_CTX does not exist
+# and is silently ignored by Ollama (the model then loads at its native max
+# context, e.g. 262K for qwen3.5 → ~9 GB of extra KV cache).
+export OLLAMA_CONTEXT_LENGTH=8192
 
+# If Ollama is already running, reuse it only when a previous aimodel run
+# started it (recorded PID still alive). Anything else — typically the Ollama
+# menu-bar app launched at login — is missing the performance env vars above,
+# so stop it and start our own instance.
+REUSE_OLLAMA=""
 if curl -sf "http://127.0.0.1:$AIMODEL_OLLAMA_PORT/api/tags" &>/dev/null; then
-  echo "  Ollama already running on port $AIMODEL_OLLAMA_PORT."
-else
+  RECORDED_PID=$(grep -E '^OLLAMA_PID=' /tmp/aimodel.pids 2>/dev/null | cut -d= -f2)
+  if [ -n "$RECORDED_PID" ] && kill -0 "$RECORDED_PID" 2>/dev/null; then
+    echo "  Ollama already running (aimodel-managed, PID $RECORDED_PID)."
+    REUSE_OLLAMA=1
+    OLLAMA_PID="$RECORDED_PID"
+  else
+    echo "  Ollama is running but was NOT started by aimodel (menu-bar app or manual launch)"
+    echo "  — its instance ignores the performance settings above. Restarting it..."
+    osascript -e 'quit app "Ollama"' &>/dev/null || true
+    pkill -f "ollama serve" 2>/dev/null || true
+    WAIT=0
+    while curl -sf "http://127.0.0.1:$AIMODEL_OLLAMA_PORT/api/tags" &>/dev/null; do
+      sleep 1
+      WAIT=$((WAIT + 1))
+      if [ $WAIT -ge 15 ]; then
+        echo "  ERROR: could not stop the existing Ollama instance on port $AIMODEL_OLLAMA_PORT."
+        echo "  Quit the Ollama menu-bar app manually, then re-run this script."
+        exit 1
+      fi
+    done
+    echo "  Existing Ollama stopped."
+  fi
+fi
+
+if [ -z "$REUSE_OLLAMA" ]; then
   echo "  Launching Ollama..."
   ollama serve > /tmp/aimodel-ollama.log 2>&1 &
   OLLAMA_PID=$!
