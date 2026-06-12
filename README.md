@@ -60,7 +60,13 @@ The proxy prints one line per completed LLM response:
 | `OLLAMA_FLASH_ATTENTION` | `1` | Cuts KV cache memory 30–50 %; no quality cost |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Halves KV memory vs f16; perplexity impact is undetectable in chat |
 | `OLLAMA_KEEP_ALIVE` | `-1` | Model stays loaded permanently |
-| `OLLAMA_NUM_CTX` | `8192` | Speed/memory sweet spot for chat workloads |
+| `OLLAMA_CONTEXT_LENGTH` | `8192` | Speed/memory sweet spot for chat workloads (`OLLAMA_NUM_CTX` is not a real variable — Ollama ignores it and loads the model at its native max context) |
+
+> **Important:** these settings only apply to the Ollama instance `start.sh`
+> launches. The Ollama **menu-bar app** (launch-at-login) starts its own server
+> with defaults (flash attention off, f16 KV, 5-min keep-alive, native max
+> context). `start.sh` detects and restarts such an instance, but to avoid the
+> churn disable *Start at login* in the Ollama app settings.
 
 ## KV Cache Type Reference
 
